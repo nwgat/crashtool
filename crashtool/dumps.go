@@ -9,58 +9,59 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
 	memoryDmpPath = `C:\Windows\MEMORY.DMP`
 	minidumpDir   = `C:\Windows\Minidump`
 
-	OFN_OVERWRITEPROMPT = 0x00000002
-	OFN_PATHMUSTEXIST   = 0x00000800
-	OFN_NOCHANGEDIR     = 0x00000008
+	ofnOverwritePrompt = 0x00000002
+	ofnNoChangeDir     = 0x00000008
+	ofnPathMustExist   = 0x00000800
 )
 
 var (
-	comdlg32            = syscall.NewLazyDLL("comdlg32.dll")
-	procGetSaveFileName = comdlg32.NewProc("GetSaveFileNameW")
+	comdlg32             = windows.NewLazySystemDLL("comdlg32.dll")
+	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
 )
 
-type OPENFILENAMEW struct {
-	LStructSize       uint32
-	HwndOwner         syscall.Handle
-	HInstance         syscall.Handle
-	LpstrFilter       *uint16
-	LpstrCustomFilter *uint16
-	NMaxCustFilter    uint32
-	NFilterIndex      uint32
-	LpstrFile         *uint16
-	NMaxFile          uint32
-	LpstrFileTitle    *uint16
-	NMaxFileTitle     uint32
-	LpstrInitialDir   *uint16
-	LpstrTitle        *uint16
-	Flags             uint32
-	NFileOffset       uint16
-	NFileExtension    uint16
-	LpstrDefExt       *uint16
-	LCustData         uintptr
-	LpfnHook          uintptr
-	LpTemplateName    *uint16
-	PvReserved        unsafe.Pointer
-	DwReserved        uint32
-	FlagsEx           uint32
+type openFileNameW struct {
+	lStructSize       uint32
+	hwndOwner         windows.HWND
+	hInstance         windows.Handle
+	lpstrFilter       *uint16
+	lpstrCustomFilter *uint16
+	nMaxCustFilter    uint32
+	nFilterIndex      uint32
+	lpstrFile         *uint16
+	nMaxFile          uint32
+	lpstrFileTitle    *uint16
+	nMaxFileTitle     uint32
+	lpstrInitialDir   *uint16
+	lpstrTitle        *uint16
+	flags             uint32
+	nFileOffset       uint16
+	nFileExtension    uint16
+	lpstrDefExt       *uint16
+	lCustData         uintptr
+	lpfnHook          uintptr
+	lpTemplateName    *uint16
+	pvReserved        unsafe.Pointer
+	dwReserved        uint32
+	flagsEx           uint32
 }
 
-type zipResult struct {
+type zipOutcome struct {
 	title   string
 	message string
-	flags   uintptr
+	flags   uint32
 }
 
-func formatBytes(b int64) string {
+func humanBytes(b int64) string {
 	const unit = 1024
 	if b < unit {
 		return fmt.Sprintf("%d B", b)
@@ -73,7 +74,7 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func inspectMemoryDump() (label string, exists bool) {
+func checkMemoryDump() (label string, available bool) {
 	info, err := os.Stat(memoryDmpPath)
 	if err != nil || info.IsDir() {
 		return fmt.Sprintf("Kernel Memory Dump — %s  (Not found)", memoryDmpPath), false
@@ -81,24 +82,24 @@ func inspectMemoryDump() (label string, exists bool) {
 	return fmt.Sprintf(
 		"Kernel Memory Dump — %s  (%s, %s)",
 		memoryDmpPath,
-		formatBytes(info.Size()),
+		humanBytes(info.Size()),
 		info.ModTime().Format("2006-01-02 15:04"),
 	), true
 }
 
-func inspectMinidumps() (label string, exists bool) {
+func checkMinidumps() (label string, available bool) {
 	entries, err := os.ReadDir(minidumpDir)
 	if err != nil {
 		return fmt.Sprintf("Small Memory Dump (Minidump) — %s\\  (No .dmp files found)", minidumpDir), false
 	}
 
 	var count int
-	var totalSize int64
+	var totalBytes int64
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".dmp") {
 			count++
 			if fi, err := e.Info(); err == nil {
-				totalSize += fi.Size()
+				totalBytes += fi.Size()
 			}
 		}
 	}
@@ -111,117 +112,122 @@ func inspectMinidumps() (label string, exists bool) {
 		"Small Memory Dump (Minidump) — %s\\  (%d files, %s)",
 		minidumpDir,
 		count,
-		formatBytes(totalSize),
+		humanBytes(totalBytes),
 	), true
 }
 
-func promptSaveZipPath(owner syscall.Handle) (string, bool) {
-	homeDir, err := os.UserHomeDir()
+func promptSaveZip(owner windows.HWND) (string, bool) {
+	initialDir, err := os.UserHomeDir()
 	if err != nil {
-		homeDir = `C:\`
+		initialDir = `C:\`
 	}
-	initialDir := filepath.Join(homeDir, "Desktop")
-	if _, err := os.Stat(initialDir); err != nil {
-		initialDir = homeDir
+	if desktop := filepath.Join(initialDir, "Desktop"); dirExists(desktop) {
+		initialDir = desktop
 	}
 
 	defaultName := fmt.Sprintf("CrashDumps_%s.zip", time.Now().Format("20060102_150405"))
-
-	fileBuf := make([]uint16, 32768)
-	defaultNameUTF16, _ := syscall.UTF16FromString(defaultName)
-	copy(fileBuf, defaultNameUTF16)
-
-	// Double-null terminated filter string
-	filterUTF16 := utf16Filter("ZIP Archives (*.zip)", "*.zip", "All Files (*.*)", "*.*")
-
-	ofn := OPENFILENAMEW{
-		LStructSize:     uint32(unsafe.Sizeof(OPENFILENAMEW{})),
-		HwndOwner:       owner,
-		LpstrFilter:     &filterUTF16[0],
-		NFilterIndex:    1,
-		LpstrFile:       &fileBuf[0],
-		NMaxFile:        uint32(len(fileBuf)),
-		LpstrInitialDir: utf16Ptr(initialDir),
-		LpstrTitle:      utf16Ptr("Save Crash Dumps Archive"),
-		Flags:           OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
-		LpstrDefExt:     utf16Ptr("zip"),
+	buf := make([]uint16, 32768)
+	if u, err := windows.UTF16FromString(defaultName); err == nil {
+		copy(buf, u)
 	}
 
-	ret, _, _ := procGetSaveFileName.Call(uintptr(unsafe.Pointer(&ofn)))
+	filter := encodeFileFilter("ZIP Archives (*.zip)", "*.zip", "All Files (*.*)", "*.*")
+	dirPtr, _ := windows.UTF16PtrFromString(initialDir)
+	titlePtr, _ := windows.UTF16PtrFromString("Save Crash Dumps Archive")
+	extPtr, _ := windows.UTF16PtrFromString("zip")
+
+	ofn := openFileNameW{
+		lStructSize:     uint32(unsafe.Sizeof(openFileNameW{})),
+		hwndOwner:       owner,
+		lpstrFilter:     &filter[0],
+		nFilterIndex:    1,
+		lpstrFile:       &buf[0],
+		nMaxFile:        uint32(len(buf)),
+		lpstrInitialDir: dirPtr,
+		lpstrTitle:      titlePtr,
+		flags:           ofnOverwritePrompt | ofnPathMustExist | ofnNoChangeDir,
+		lpstrDefExt:     extPtr,
+	}
+
+	ret, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
 	if ret == 0 {
 		return "", false
 	}
-
-	return syscall.UTF16ToString(fileBuf), true
+	return windows.UTF16ToString(buf), true
 }
 
-func utf16Filter(pairs ...string) []uint16 {
+func dirExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
+}
+
+func encodeFileFilter(pairs ...string) []uint16 {
 	var out []uint16
 	for _, s := range pairs {
-		u, _ := syscall.UTF16FromString(s)
-		out = append(out, u...)
+		if u, err := windows.UTF16FromString(s); err == nil {
+			out = append(out, u...)
+		}
 	}
-	out = append(out, 0)
-	return out
+	return append(out, 0)
 }
 
-func addFileToZip(zw *zip.Writer, srcPath, zipEntryName string) error {
+func writeZipEntry(zw *zip.Writer, srcPath, entryName string) error {
 	f, err := os.Open(srcPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
+	fi, err := f.Stat()
 	if err != nil {
 		return err
 	}
 
-	header, err := zip.FileInfoHeader(info)
+	hdr, err := zip.FileInfoHeader(fi)
 	if err != nil {
 		return err
 	}
-	header.Name = zipEntryName
-	header.Method = zip.Deflate
+	hdr.Name = entryName
+	hdr.Method = zip.Deflate
 
-	writer, err := zw.CreateHeader(header)
+	w, err := zw.CreateHeader(hdr)
 	if err != nil {
 		return err
 	}
 
-	_, err = io.Copy(writer, f)
+	_, err = io.Copy(w, f)
 	return err
 }
 
-func buildCrashDumpZip(zipPath string, includeMemDmp, includeMinidump bool) zipResult {
+func createCrashDumpArchive(zipPath string, includeMemDmp, includeMinidump bool) zipOutcome {
 	outFile, err := os.Create(zipPath)
 	if err != nil {
-		return zipResult{
+		return zipOutcome{
 			title:   "Compression Error",
 			message: fmt.Sprintf("Failed to create zip file:\n%v", err),
-			flags:   MB_ICONERROR,
+			flags:   windows.MB_ICONERROR,
 		}
 	}
 
 	zw := zip.NewWriter(outFile)
-	filesAdded := 0
+	added := 0
 
-	cleanupAndFail := func(msg string) zipResult {
+	abort := func(msg string) zipOutcome {
 		zw.Close()
 		outFile.Close()
 		os.Remove(zipPath)
-		return zipResult{
+		return zipOutcome{
 			title:   "Compression Error",
 			message: msg,
-			flags:   MB_ICONERROR,
+			flags:   windows.MB_ICONERROR,
 		}
 	}
 
 	if includeMemDmp {
-		if err := addFileToZip(zw, memoryDmpPath, "MEMORY.DMP"); err != nil {
-			return cleanupAndFail(fmt.Sprintf("Failed adding MEMORY.DMP:\n%v", err))
+		if err := writeZipEntry(zw, memoryDmpPath, "MEMORY.DMP"); err != nil {
+			return abort(fmt.Sprintf("Failed adding MEMORY.DMP:\n%v", err))
 		}
-		filesAdded++
+		added++
 	}
 
 	if includeMinidump {
@@ -229,12 +235,12 @@ func buildCrashDumpZip(zipPath string, includeMemDmp, includeMinidump bool) zipR
 		if err == nil {
 			for _, e := range entries {
 				if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".dmp") {
-					fullPath := filepath.Join(minidumpDir, e.Name())
-					entryPath := filepath.Join("Minidump", e.Name())
-					if err := addFileToZip(zw, fullPath, entryPath); err != nil {
-						return cleanupAndFail(fmt.Sprintf("Failed adding %s:\n%v", e.Name(), err))
+					src := filepath.Join(minidumpDir, e.Name())
+					dst := filepath.Join("Minidump", e.Name())
+					if err := writeZipEntry(zw, src, dst); err != nil {
+						return abort(fmt.Sprintf("Failed adding %s:\n%v", e.Name(), err))
 					}
-					filesAdded++
+					added++
 				}
 			}
 		}
@@ -243,23 +249,23 @@ func buildCrashDumpZip(zipPath string, includeMemDmp, includeMinidump bool) zipR
 	zw.Close()
 	outFile.Close()
 
-	if filesAdded == 0 {
+	if added == 0 {
 		os.Remove(zipPath)
-		return zipResult{
+		return zipOutcome{
 			title:   "Nothing Compressed",
 			message: "No dump files were found to compress.",
-			flags:   MB_ICONWARNING,
+			flags:   windows.MB_ICONWARNING,
 		}
 	}
 
-	var zipSize string
+	var sizeText string
 	if fi, err := os.Stat(zipPath); err == nil {
-		zipSize = formatBytes(fi.Size())
+		sizeText = humanBytes(fi.Size())
 	}
 
-	return zipResult{
+	return zipOutcome{
 		title:   "Compression Complete",
-		message: fmt.Sprintf("Successfully compressed %d file(s) (%s).\n\nSaved to:\n%s", filesAdded, zipSize, zipPath),
-		flags:   MB_ICONINFORMATION,
+		message: fmt.Sprintf("Successfully compressed %d file(s) (%s).\n\nSaved to:\n%s", added, sizeText, zipPath),
+		flags:   windows.MB_ICONINFORMATION,
 	}
 }

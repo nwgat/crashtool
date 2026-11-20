@@ -9,498 +9,306 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
-)
 
-var (
-	user32   = syscall.NewLazyDLL("user32.dll")
-	kernel32 = syscall.NewLazyDLL("kernel32.dll")
-	gdi32    = syscall.NewLazyDLL("gdi32.dll")
-	comctl32 = syscall.NewLazyDLL("comctl32.dll")
-	dwmapi   = syscall.NewLazyDLL("dwmapi.dll")
-
-	procRegisterClassExW          = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW           = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW            = user32.NewProc("DefWindowProcW")
-	procGetMessageW               = user32.NewProc("GetMessageW")
-	procTranslateMessage          = user32.NewProc("TranslateMessage")
-	procDispatchMessageW          = user32.NewProc("DispatchMessageW")
-	procPostQuitMessage           = user32.NewProc("PostQuitMessage")
-	procSendMessageW              = user32.NewProc("SendMessageW")
-	procPostMessageW              = user32.NewProc("PostMessageW")
-	procSetWindowTextW            = user32.NewProc("SetWindowTextW")
-	procEnableWindow              = user32.NewProc("EnableWindow")
-	procMessageBoxW               = user32.NewProc("MessageBoxW")
-	procGetDpiForSystem           = user32.NewProc("GetDpiForSystem")
-	procAdjustWindowRectEx        = user32.NewProc("AdjustWindowRectEx")
-	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
-
-	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
-	procMulDiv           = kernel32.NewProc("MulDiv")
-
-	procCreateFontW      = gdi32.NewProc("CreateFontW")
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procSetBkMode        = gdi32.NewProc("SetBkMode")
-	procSetTextColor     = gdi32.NewProc("SetTextColor")
-
-	procInitCommonControlsEx  = comctl32.NewProc("InitCommonControlsEx")
-	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
+	"golang.org/x/sys/windows"
 )
 
 const (
-	WS_OVERLAPPED  = 0x00000000
-	WS_CAPTION     = 0x00C00000
-	WS_SYSMENU     = 0x00080000
-	WS_MINIMIZEBOX = 0x00020000
-	WS_VISIBLE     = 0x10000000
-	WS_CHILD       = 0x40000000
-	WS_TABSTOP     = 0x00010000
-
-	BS_PUSHBUTTON    = 0x00000000
-	BS_DEFPUSHBUTTON = 0x00000001
-	BS_AUTOCHECKBOX  = 0x00000003
-	SS_LEFT          = 0x00000000
-	SS_ETCHEDHORZ    = 0x00000010
-
-	WM_DESTROY        = 0x0002
-	WM_COMMAND        = 0x0111
-	WM_CTLCOLORSTATIC = 0x0138
-	WM_CTLCOLORBTN    = 0x0135
-	WM_SETFONT        = 0x0030
-	WM_APP_ZIP_DONE   = 0x8001
-
-	BM_GETCHECK   = 0x00F0
-	BM_SETCHECK   = 0x00F1
-	BST_UNCHECKED = 0x0000
-	BST_CHECKED   = 0x0001
-
-	MB_YESNO           = 0x00000004
-	MB_ICONERROR       = 0x00000010
-	MB_ICONWARNING     = 0x00000030
-	MB_ICONINFORMATION = 0x00000040
-	IDYES              = 6
-
-	CW_USEDEFAULT = 0x80000000
-
-	CLEARTYPE_QUALITY = 5
-	TRANSPARENT       = 1
-
-	DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ^uintptr(3) // -4
-
-	ID_BTN_APPLY       = 101
-	ID_BTN_DEFAULTS    = 102
-	ID_BTN_REFRESH     = 103
-	ID_BTN_RESTART     = 104
-	ID_BTN_SELECT_ALL  = 105
-	ID_BTN_SELECT_NONE = 106
-	ID_CHK_MEMORYDMP   = 107
-	ID_CHK_MINIDUMP    = 108
-	ID_BTN_ZIP         = 109
-	ID_CHK_REG_BASE    = 200
+	idBtnApply     = 101
+	idBtnDefaults  = 102
+	idBtnRefresh   = 103
+	idBtnRestart   = 104
+	idChkMemoryDmp = 107
+	idChkMinidump  = 108
+	idBtnZip       = 109
+	idChkRegBase   = 200
 )
 
-type WNDCLASSEXW struct {
-	CbSize        uint32
-	Style         uint32
-	LpfnWndProc   uintptr
-	CbClsExtra    int32
-	CbWndExtra    int32
-	HInstance     syscall.Handle
-	HIcon         syscall.Handle
-	HCursor       syscall.Handle
-	HbrBackground syscall.Handle
-	LpszMenuName  *uint16
-	LpszClassName *uint16
-	HIconSm       syscall.Handle
-}
+type checkSyncMode int
 
-type POINT struct{ X, Y int32 }
-type RECT struct{ Left, Top, Right, Bottom int32 }
-
-type MSG struct {
-	HWnd    syscall.Handle
-	Message uint32
-	WParam  uintptr
-	LParam  uintptr
-	Time    uint32
-	Pt      POINT
-}
-
-type INITCOMMONCONTROLSEX struct {
-	DwSize uint32
-	DwICC  uint32
-}
+const (
+	checkKeep checkSyncMode = iota
+	checkAll
+	checkDefaults
+)
 
 var (
-	hMainWnd     syscall.Handle
-	hChkMemDmp   syscall.Handle
-	hChkMinidump syscall.Handle
-	hBtnZip      syscall.Handle
-	hBgBrush     syscall.Handle
-	dpiScale     float64 = 1.0
+	mainWnd     windows.HWND
+	chkMemDmp   windows.HWND
+	chkMinidump windows.HWND
+	btnZip      windows.HWND
+	bgBrush     windows.Handle
 
-	lastZipMu  sync.Mutex
-	lastZipRes zipResult
+	zipMu      sync.Mutex
+	lastZipRes zipOutcome
 )
 
-func utf16Ptr(s string) *uint16 {
-	p, _ := syscall.UTF16PtrFromString(s)
-	return p
-}
-
-func scale(px int32) int32 {
-	return int32(float64(px) * dpiScale)
-}
-
-func showAlert(hwnd syscall.Handle, title, text string, flags uintptr) uintptr {
-	ret, _, _ := procMessageBoxW.Call(
-		uintptr(hwnd),
-		uintptr(unsafe.Pointer(utf16Ptr(text))),
-		uintptr(unsafe.Pointer(utf16Ptr(title))),
-		flags,
-	)
-	return ret
-}
-
-func setText(hwnd syscall.Handle, text string) {
-	procSetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(utf16Ptr(text))))
-}
-
-func setEnabled(hwnd syscall.Handle, enabled bool) {
-	var flag uintptr
-	if enabled {
-		flag = 1
-	}
-	procEnableWindow.Call(uintptr(hwnd), flag)
-}
-
-func isChecked(hwnd syscall.Handle) bool {
-	ret, _, _ := procSendMessageW.Call(uintptr(hwnd), BM_GETCHECK, 0, 0)
-	return ret == BST_CHECKED
-}
-
-func setChecked(hwnd syscall.Handle, checked bool) {
-	state := uintptr(BST_UNCHECKED)
-	if checked {
-		state = uintptr(BST_CHECKED)
-	}
-	procSendMessageW.Call(uintptr(hwnd), BM_SETCHECK, state, 0)
-}
-
-func initUI() {
-	procSetProcessDpiAwarenessCtx.Call(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-
-	if dpi, _, _ := procGetDpiForSystem.Call(); dpi > 0 {
-		dpiScale = float64(dpi) / 96.0
-	}
-
-	icc := INITCOMMONCONTROLSEX{
-		DwSize: uint32(unsafe.Sizeof(INITCOMMONCONTROLSEX{})),
-		DwICC:  0x00004000 | 0x00000008, // ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES
-	}
-	procInitCommonControlsEx.Call(uintptr(unsafe.Pointer(&icc)))
-}
-
-func createModernFont(face string, ptSize, weight int32) syscall.Handle {
-	dpi := int32(96 * dpiScale)
-	height, _, _ := procMulDiv.Call(uintptr(-ptSize), uintptr(dpi), 72)
-	hFont, _, _ := procCreateFontW.Call(
-		height, 0, 0, 0,
-		uintptr(weight),
-		0, 0, 0, 1, 0, 0,
-		CLEARTYPE_QUALITY, 0,
-		uintptr(unsafe.Pointer(utf16Ptr(face))),
-	)
-	return syscall.Handle(hFont)
-}
-
-func refreshDisplay(usePreSelect bool) {
-	for _, s := range settings {
-		if s.Hwnd == 0 {
+func syncUIState(mode checkSyncMode) {
+	for i := range regSettings {
+		s := &regSettings[i]
+		if s.CheckboxHwnd == 0 {
 			continue
 		}
-		badge, isCustom := s.queryStatus()
-		setText(s.Hwnd, fmt.Sprintf("%s   —   %s", s.FriendlyDesc, badge))
-		if usePreSelect {
-			setChecked(s.Hwnd, isCustom || s.PreSelect)
-		} else {
-			setChecked(s.Hwnd, isCustom)
+
+		s.Enabled = s.isCustomApplied()
+		if s.StatusHwnd != 0 {
+			if s.Enabled {
+				setControlText(s.StatusHwnd, "Enabled")
+			} else {
+				setControlText(s.StatusHwnd, "Not Enabled")
+			}
+			procInvalidateRect.Call(uintptr(s.StatusHwnd), 0, 1)
+		}
+
+		switch mode {
+		case checkAll:
+			setChecked(s.CheckboxHwnd, true)
+		case checkDefaults:
+			setChecked(s.CheckboxHwnd, s.isDefaultChecked())
 		}
 	}
 
-	if hChkMemDmp != 0 {
-		label, ok := inspectMemoryDump()
-		setText(hChkMemDmp, label)
-		if !ok {
-			setChecked(hChkMemDmp, false)
+	if chkMemDmp != 0 {
+		label, ok := checkMemoryDump()
+		setControlText(chkMemDmp, label)
+		setControlEnabled(chkMemDmp, ok)
+		if mode == checkAll {
+			setChecked(chkMemDmp, ok)
+		} else if !ok {
+			setChecked(chkMemDmp, false)
 		}
-		setEnabled(hChkMemDmp, ok)
 	}
 
-	if hChkMinidump != 0 {
-		label, ok := inspectMinidumps()
-		setText(hChkMinidump, label)
-		if !ok {
-			setChecked(hChkMinidump, false)
+	if chkMinidump != 0 {
+		label, ok := checkMinidumps()
+		setControlText(chkMinidump, label)
+		setControlEnabled(chkMinidump, ok)
+		if mode == checkAll {
+			setChecked(chkMinidump, ok)
+		} else if !ok {
+			setChecked(chkMinidump, false)
 		}
-		setEnabled(hChkMinidump, ok)
 	}
 }
 
-func startAsyncCompression(zipPath string, includeMemDmp, includeMinidump bool) {
-	setEnabled(hBtnZip, false)
-	setText(hBtnZip, "Compressing...")
+func startZipWorker(zipPath string, incMem, incMini bool) {
+	setControlEnabled(btnZip, false)
+	setControlText(btnZip, "Compressing...")
 
 	go func() {
-		res := buildCrashDumpZip(zipPath, includeMemDmp, includeMinidump)
-		lastZipMu.Lock()
-		lastZipRes = res
-		lastZipMu.Unlock()
-		procPostMessageW.Call(uintptr(hMainWnd), WM_APP_ZIP_DONE, 0, 0)
+		outcome := createCrashDumpArchive(zipPath, incMem, incMini)
+		zipMu.Lock()
+		lastZipRes = outcome
+		zipMu.Unlock()
+		procPostMessageW.Call(uintptr(mainWnd), wmAppZipDone, 0, 0)
 	}()
 }
 
-func restartComputer(hwnd syscall.Handle) {
-	ret := showAlert(
+func triggerSystemRestart(hwnd windows.HWND) {
+	ans := alert(
 		hwnd,
 		"Confirm Restart",
 		"Are you sure you want to restart Windows immediately?\nAny unsaved work will be lost.",
-		MB_YESNO|MB_ICONWARNING,
+		windows.MB_YESNO|windows.MB_ICONWARNING,
 	)
-	if ret != IDYES {
+	if ans != idYes {
 		return
 	}
 
 	cmd := exec.Command("shutdown", "-r", "-t", "0")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Run(); err != nil {
-		showAlert(hwnd, "Restart Error", fmt.Sprintf("Failed to trigger restart:\n%v", err), MB_ICONERROR)
+		alert(hwnd, "Restart Error", fmt.Sprintf("Failed to trigger restart:\n%v", err), windows.MB_ICONERROR)
 	}
 }
 
-func wndProc(hwnd syscall.Handle, msg uint32, wparam, lparam uintptr) uintptr {
-	switch msg {
-	case WM_CTLCOLORSTATIC, WM_CTLCOLORBTN:
-		hdc := syscall.Handle(wparam)
-		procSetBkMode.Call(uintptr(hdc), TRANSPARENT)
-		procSetTextColor.Call(uintptr(hdc), 0x001E1E1E)
-		return uintptr(hBgBrush)
+func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
+	switch uMsg {
+	case wmCtlColorStatic, wmCtlColorBtn:
+		hdc := windows.Handle(wParam)
+		ctrl := windows.HWND(lParam)
+		procSetBkMode.Call(uintptr(hdc), transparentMode)
 
-	case WM_APP_ZIP_DONE:
-		setText(hBtnZip, "Zip Selected Dumps")
-		setEnabled(hBtnZip, true)
+		color := uintptr(colorTextDefault)
+		for _, s := range regSettings {
+			if s.StatusHwnd != 0 && s.StatusHwnd == ctrl {
+				if s.Enabled {
+					color = colorGreen
+				} else {
+					color = colorRed
+				}
+				break
+			}
+		}
 
-		lastZipMu.Lock()
+		procSetTextColor.Call(uintptr(hdc), color)
+		return uintptr(bgBrush)
+
+	case wmAppZipDone:
+		setControlText(btnZip, "Zip Selected Dumps")
+		setControlEnabled(btnZip, true)
+
+		zipMu.Lock()
 		res := lastZipRes
-		lastZipMu.Unlock()
+		zipMu.Unlock()
 
-		showAlert(hwnd, res.title, res.message, res.flags)
+		alert(hwnd, res.title, res.message, res.flags)
 		return 0
 
-	case WM_COMMAND:
-		switch uint16(wparam & 0xFFFF) {
-		case ID_BTN_APPLY:
-			if err := applySelectedSettings(); err != nil {
-				showAlert(hwnd, "Registry Error", err.Error(), MB_ICONERROR)
+	case wmCommand:
+		switch uint16(wParam & 0xFFFF) {
+		case idBtnApply:
+			if err := applyCheckedRegistrySettings(); err != nil {
+				alert(hwnd, "Registry Error", err.Error(), windows.MB_ICONERROR)
 			} else {
-				refreshDisplay(false)
-				showAlert(
+				syncUIState(checkKeep)
+				alert(
 					hwnd,
 					"Applied",
-					"Custom settings applied for checked items (unchecked items set to Windows defaults).\nRestart Windows for changes to take effect.",
-					MB_ICONINFORMATION,
+					"Custom settings applied for checked items.\nRestart Windows for changes to take effect.",
+					windows.MB_ICONINFORMATION,
 				)
 			}
 
-		case ID_BTN_DEFAULTS:
-			if err := restoreAllDefaults(); err != nil {
-				showAlert(hwnd, "Registry Error", err.Error(), MB_ICONERROR)
+		case idBtnDefaults:
+			if err := restoreDefaultRegistrySettings(); err != nil {
+				alert(hwnd, "Registry Error", err.Error(), windows.MB_ICONERROR)
 			} else {
-				refreshDisplay(false)
-				showAlert(
+				syncUIState(checkDefaults)
+				alert(
 					hwnd,
 					"Defaults Restored",
-					"All settings restored to Windows defaults.\nRestart Windows for changes to take effect.",
-					MB_ICONINFORMATION,
+					"All settings and checkboxes restored to Windows defaults.\nRestart Windows for changes to take effect.",
+					windows.MB_ICONINFORMATION,
 				)
 			}
 
-		case ID_BTN_SELECT_ALL:
-			for _, s := range settings {
-				setChecked(s.Hwnd, true)
-			}
+		case idBtnRefresh:
+			syncUIState(checkKeep)
 
-		case ID_BTN_SELECT_NONE:
-			for _, s := range settings {
-				setChecked(s.Hwnd, false)
-			}
+		case idBtnRestart:
+			triggerSystemRestart(hwnd)
 
-		case ID_BTN_REFRESH:
-			refreshDisplay(false)
-
-		case ID_BTN_RESTART:
-			restartComputer(hwnd)
-
-		case ID_BTN_ZIP:
-			incMem := isChecked(hChkMemDmp)
-			incMini := isChecked(hChkMinidump)
+		case idBtnZip:
+			incMem := isChecked(chkMemDmp)
+			incMini := isChecked(chkMinidump)
 			if !incMem && !incMini {
-				showAlert(hwnd, "No Selection", "Please check at least one crash dump option first.", MB_ICONWARNING)
+				alert(hwnd, "No Selection", "Please check at least one crash dump option first.", windows.MB_ICONWARNING)
 				return 0
 			}
-			zipPath, ok := promptSaveZipPath(hwnd)
-			if !ok {
-				return 0
+			if zipPath, ok := promptSaveZip(hwnd); ok {
+				startZipWorker(zipPath, incMem, incMini)
 			}
-			startAsyncCompression(zipPath, incMem, incMini)
 		}
 		return 0
 
-	case WM_DESTROY:
+	case wmDestroy:
 		procPostQuitMessage.Call(0)
 		return 0
 	}
 
-	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wparam, lparam)
+	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(uMsg), wParam, lParam)
 	return ret
-}
-
-func createControl(parent, hInst, hFont syscall.Handle, class, text string, style uintptr, id int, x, y, w, h int32) syscall.Handle {
-	var textPtr uintptr
-	if text != "" {
-		textPtr = uintptr(unsafe.Pointer(utf16Ptr(text)))
-	}
-	ret, _, _ := procCreateWindowExW.Call(
-		0,
-		uintptr(unsafe.Pointer(utf16Ptr(class))),
-		textPtr,
-		style,
-		uintptr(scale(x)), uintptr(scale(y)), uintptr(scale(w)), uintptr(scale(h)),
-		uintptr(parent),
-		uintptr(id),
-		uintptr(hInst),
-		0,
-	)
-	ctrl := syscall.Handle(ret)
-	if hFont != 0 {
-		procSendMessageW.Call(uintptr(ctrl), WM_SETFONT, uintptr(hFont), 1)
-	}
-	return ctrl
-}
-
-func addLabel(parent, hInst, hFont syscall.Handle, text string, x, y, w, h int32) syscall.Handle {
-	return createControl(parent, hInst, hFont, "STATIC", text, WS_CHILD|WS_VISIBLE|SS_LEFT, 0, x, y, w, h)
-}
-
-func addButton(parent, hInst, hFont syscall.Handle, text string, id int, x, y, w, h int32, isDefault bool) syscall.Handle {
-	style := uintptr(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON)
-	if isDefault {
-		style = uintptr(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON)
-	}
-	return createControl(parent, hInst, hFont, "BUTTON", text, style, id, x, y, w, h)
-}
-
-func addCheckbox(parent, hInst, hFont syscall.Handle, text string, id int, x, y, w, h int32) syscall.Handle {
-	return createControl(parent, hInst, hFont, "BUTTON", text, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, id, x, y, w, h)
 }
 
 func main() {
 	runtime.LockOSThread()
-	initUI()
+	initWin32()
 
-	bgBrushRet, _, _ := procCreateSolidBrush.Call(0x00F6F6F6)
-	hBgBrush = syscall.Handle(bgBrushRet)
+	brushRet, _, _ := procCreateSolidBrush.Call(colorBgSurface)
+	bgBrush = windows.Handle(brushRet)
 
-	hInstRet, _, _ := procGetModuleHandleW.Call(0)
-	hInst := syscall.Handle(hInstRet)
+	var hInst windows.Handle
+	_ = windows.GetModuleHandleEx(0, nil, &hInst)
 
-	className := utf16Ptr("CrashToolModernClass")
-	wc := WNDCLASSEXW{
-		CbSize:        uint32(unsafe.Sizeof(WNDCLASSEXW{})),
-		LpfnWndProc:   syscall.NewCallback(wndProc),
-		HInstance:     hInst,
-		HbrBackground: hBgBrush,
-		LpszClassName: className,
+	className := mustUTF16("CrashToolModernClass")
+	wc := wndClassExW{
+		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
+		lpfnWndProc:   syscall.NewCallback(wndProc),
+		hInstance:     hInst,
+		hbrBackground: bgBrush,
+		lpszClassName: className,
 	}
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
-	style := uint32(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE)
-	rc := RECT{0, 0, scale(700), scale(510)}
+	style := uint32(wsOverlapped | wsCaption | wsSysMenu | wsMinimizeBox | wsVisible)
+	rc := rect{0, 0, px(700), px(510)}
 	procAdjustWindowRectEx.Call(uintptr(unsafe.Pointer(&rc)), uintptr(style), 0, 0)
 
 	hwndRet, _, _ := procCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(utf16Ptr("CrashTool"))),
+		uintptr(unsafe.Pointer(mustUTF16("CrashTool"))),
 		uintptr(style),
-		CW_USEDEFAULT, CW_USEDEFAULT,
-		uintptr(rc.Right-rc.Left), uintptr(rc.Bottom-rc.Top),
+		cwUseDefault, cwUseDefault,
+		uintptr(rc.right-rc.left), uintptr(rc.bottom-rc.top),
 		0, 0,
 		uintptr(hInst),
 		0,
 	)
-	hMainWnd = syscall.Handle(hwndRet)
+	mainWnd = windows.HWND(hwndRet)
 
 	cornerPref := uint32(2) // DWMWCP_ROUND
-	procDwmSetWindowAttribute.Call(uintptr(hMainWnd), 33, uintptr(unsafe.Pointer(&cornerPref)), unsafe.Sizeof(cornerPref))
+	procDwmSetWindowAttribute.Call(uintptr(mainWnd), 33, uintptr(unsafe.Pointer(&cornerPref)), unsafe.Sizeof(cornerPref))
 
-	fontTitle := createModernFont("Segoe UI Variable Display", 15, 600)
-	fontSection := createModernFont("Segoe UI", 10, 600)
-	fontKeyPath := createModernFont("Segoe UI", 9, 600)
-	fontBody := createModernFont("Segoe UI", 9, 400)
-	fontSmall := createModernFont("Segoe UI", 8, 400)
+	fontTitle := makeFont("Segoe UI Variable Display", 15, 600)
+	fontSection := makeFont("Segoe UI", 10, 600)
+	fontBold := makeFont("Segoe UI", 9, 600)
+	fontBody := makeFont("Segoe UI", 9, 400)
+
+	ui := uiBuilder{parent: mainWnd, hInst: hInst}
 
 	// Header
-	addLabel(hMainWnd, hInst, fontTitle, "Windows Crash && TDR Configuration", 24, 18, 480, 30)
-	addButton(hMainWnd, hInst, fontBody, "Restart PC", ID_BTN_RESTART, 566, 18, 110, 30, false)
+	ui.label("Windows Crash && TDR Configuration", 24, 18, 480, 30, fontTitle)
+	ui.button("Restart PC", idBtnRestart, 566, 18, 110, 30, fontBody, false)
 
-	// Registry Section Header
-	addLabel(hMainWnd, hInst, fontSection, "Registry Settings", 24, 62, 300, 22)
-	addButton(hMainWnd, hInst, fontSmall, "Check All", ID_BTN_SELECT_ALL, 518, 58, 75, 24, false)
-	addButton(hMainWnd, hInst, fontSmall, "Uncheck All", ID_BTN_SELECT_NONE, 601, 58, 75, 24, false)
+	// Registry Section
+	ui.label("Registry Settings", 24, 62, 460, 22, fontSection)
+	ui.rightLabel("Current Registry Status", 496, 62, 180, 22, fontBold)
 
-	// Grouped Registry Checkboxes
-	yPos := int32(90)
-	lastSubKey := ""
-	for i := range settings {
-		if settings[i].SubKey != lastSubKey {
-			if lastSubKey != "" {
-				yPos += 10
+	y := int32(90)
+	lastKey := ""
+	for i := range regSettings {
+		if regSettings[i].SubKey != lastKey {
+			if lastKey != "" {
+				y += 10
 			}
-			addLabel(hMainWnd, hInst, fontKeyPath, `HKLM\`+settings[i].SubKey, 24, yPos, 652, 20)
-			yPos += 24
-			lastSubKey = settings[i].SubKey
+			ui.label(`HKLM\`+regSettings[i].SubKey, 24, y, 652, 20, fontBold)
+			y += 24
+			lastKey = regSettings[i].SubKey
 		}
 
-		settings[i].Hwnd = addCheckbox(hMainWnd, hInst, fontBody, settings[i].FriendlyDesc, ID_CHK_REG_BASE+i, 36, yPos, 640, 24)
-		yPos += 27
+		regSettings[i].CheckboxHwnd = ui.checkbox(regSettings[i].Description, idChkRegBase+i, 36, y, 490, 24, fontBody)
+		regSettings[i].StatusHwnd = ui.rightLabel("Not Enabled", 536, y+3, 140, 20, fontBold)
+		y += 27
 	}
 
-	// Registry Action Buttons
-	btnY := yPos + 14
-	addButton(hMainWnd, hInst, fontBody, "Apply", ID_BTN_APPLY, 24, btnY, 130, 34, true)
-	addButton(hMainWnd, hInst, fontBody, "Defaults", ID_BTN_DEFAULTS, 164, btnY, 130, 34, false)
-	addButton(hMainWnd, hInst, fontBody, "Refresh Status", ID_BTN_REFRESH, 546, btnY, 130, 34, false)
+	// Registry Action Bar
+	y += 14
+	ui.button("Apply", idBtnApply, 24, y, 130, 34, fontBody, true)
+	ui.button("Defaults", idBtnDefaults, 164, y, 130, 34, fontBody, false)
+	ui.button("Refresh Status", idBtnRefresh, 546, y, 130, 34, fontBody, false)
 
-	// Horizontal Divider
-	divY := btnY + 52
-	createControl(hMainWnd, hInst, 0, "STATIC", "", WS_CHILD|WS_VISIBLE|SS_ETCHEDHORZ, 0, 24, divY, 652, 2)
+	// Divider
+	y += 52
+	ui.divider(24, y, 652)
 
 	// Crash Dump Export Section
-	expY := divY + 14
-	addLabel(hMainWnd, hInst, fontSection, "Export Crash Dumps", 24, expY, 652, 22)
-	hChkMemDmp = addCheckbox(hMainWnd, hInst, fontBody, `Kernel Memory Dump — C:\Windows\MEMORY.DMP`, ID_CHK_MEMORYDMP, 36, expY+28, 640, 24)
-	hChkMinidump = addCheckbox(hMainWnd, hInst, fontBody, `Small Memory Dump (Minidump) — C:\Windows\Minidump\`, ID_CHK_MINIDUMP, 36, expY+56, 640, 24)
-	hBtnZip = addButton(hMainWnd, hInst, fontBody, "Zip Selected Dumps", ID_BTN_ZIP, 24, expY+92, 180, 34, false)
+	y += 14
+	ui.label("Export Crash Dumps", 24, y, 652, 22, fontSection)
+	chkMemDmp = ui.checkbox(`Kernel Memory Dump — C:\Windows\MEMORY.DMP`, idChkMemoryDmp, 36, y+28, 640, 24, fontBody)
+	chkMinidump = ui.checkbox(`Small Memory Dump (Minidump) — C:\Windows\Minidump\`, idChkMinidump, 36, y+56, 640, 24, fontBody)
+	btnZip = ui.button("Zip Selected Dumps", idBtnZip, 24, y+92, 180, 34, fontBody, false)
 
-	refreshDisplay(true)
+	syncUIState(checkAll)
 
-	var msg MSG
+	var m msg
 	for {
-		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if int32(ret) <= 0 {
 			break
 		}
-		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
 }
