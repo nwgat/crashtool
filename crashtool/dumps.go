@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -18,47 +17,14 @@ import (
 const (
 	memoryDmpPath = `C:\Windows\MEMORY.DMP`
 	minidumpDir   = `C:\Windows\Minidump`
-
-	ofnOverwritePrompt = 0x00000002
-	ofnNoChangeDir     = 0x00000008
-	ofnPathMustExist   = 0x00000800
 )
-
-var (
-	comdlg32             = windows.NewLazySystemDLL("comdlg32.dll")
-	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
-)
-
-type openFileNameW struct {
-	lStructSize       uint32
-	hwndOwner         windows.HWND
-	hInstance         windows.Handle
-	lpstrFilter       *uint16
-	lpstrCustomFilter *uint16
-	nMaxCustFilter    uint32
-	nFilterIndex      uint32
-	lpstrFile         *uint16
-	nMaxFile          uint32
-	lpstrFileTitle    *uint16
-	nMaxFileTitle     uint32
-	lpstrInitialDir   *uint16
-	lpstrTitle        *uint16
-	flags             uint32
-	nFileOffset       uint16
-	nFileExtension    uint16
-	lpstrDefExt       *uint16
-	lCustData         uintptr
-	lpfnHook          uintptr
-	lpTemplateName    *uint16
-	pvReserved        unsafe.Pointer
-	dwReserved        uint32
-	flagsEx           uint32
-}
 
 type zipOutcome struct {
 	title   string
 	message string
 	flags   uint32
+	zipPath string
+	success bool
 }
 
 func humanBytes(b int64) string {
@@ -116,59 +82,14 @@ func checkMinidumps() (label string, available bool) {
 	), true
 }
 
-func promptSaveZip(owner windows.HWND) (string, bool) {
-	initialDir, err := os.UserHomeDir()
+func defaultAppZipPath() (string, error) {
+	exePath, err := os.Executable()
 	if err != nil {
-		initialDir = `C:\`
+		return "", fmt.Errorf("failed to resolve application directory: %w", err)
 	}
-	if desktop := filepath.Join(initialDir, "Desktop"); dirExists(desktop) {
-		initialDir = desktop
-	}
-
-	defaultName := fmt.Sprintf("CrashDumps_%s.zip", time.Now().Format("20060102_150405"))
-	buf := make([]uint16, 32768)
-	if u, err := windows.UTF16FromString(defaultName); err == nil {
-		copy(buf, u)
-	}
-
-	filter := encodeFileFilter("ZIP Archives (*.zip)", "*.zip", "All Files (*.*)", "*.*")
-	dirPtr, _ := windows.UTF16PtrFromString(initialDir)
-	titlePtr, _ := windows.UTF16PtrFromString("Save Crash Dumps Archive")
-	extPtr, _ := windows.UTF16PtrFromString("zip")
-
-	ofn := openFileNameW{
-		lStructSize:     uint32(unsafe.Sizeof(openFileNameW{})),
-		hwndOwner:       owner,
-		lpstrFilter:     &filter[0],
-		nFilterIndex:    1,
-		lpstrFile:       &buf[0],
-		nMaxFile:        uint32(len(buf)),
-		lpstrInitialDir: dirPtr,
-		lpstrTitle:      titlePtr,
-		flags:           ofnOverwritePrompt | ofnPathMustExist | ofnNoChangeDir,
-		lpstrDefExt:     extPtr,
-	}
-
-	ret, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
-	if ret == 0 {
-		return "", false
-	}
-	return windows.UTF16ToString(buf), true
-}
-
-func dirExists(path string) bool {
-	fi, err := os.Stat(path)
-	return err == nil && fi.IsDir()
-}
-
-func encodeFileFilter(pairs ...string) []uint16 {
-	var out []uint16
-	for _, s := range pairs {
-		if u, err := windows.UTF16FromString(s); err == nil {
-			out = append(out, u...)
-		}
-	}
-	return append(out, 0)
+	appDir := filepath.Dir(exePath)
+	fileName := fmt.Sprintf("CrashDumps_%s.zip", time.Now().Format("20060102_150405"))
+	return filepath.Join(appDir, fileName), nil
 }
 
 func writeZipEntry(zw *zip.Writer, srcPath, entryName string) error {
@@ -267,5 +188,7 @@ func createCrashDumpArchive(zipPath string, includeMemDmp, includeMinidump bool)
 		title:   "Compression Complete",
 		message: fmt.Sprintf("Successfully compressed %d file(s) (%s).\n\nSaved to:\n%s", added, sizeText, zipPath),
 		flags:   windows.MB_ICONINFORMATION,
+		zipPath: zipPath,
+		success: true,
 	}
 }

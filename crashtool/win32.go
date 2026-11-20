@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -30,8 +31,16 @@ var (
 	procGetDpiForSystem           = user32.NewProc("GetDpiForSystem")
 	procAdjustWindowRectEx        = user32.NewProc("AdjustWindowRectEx")
 	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
+	procOpenClipboard             = user32.NewProc("OpenClipboard")
+	procCloseClipboard            = user32.NewProc("CloseClipboard")
+	procEmptyClipboard            = user32.NewProc("EmptyClipboard")
+	procSetClipboardData          = user32.NewProc("SetClipboardData")
 
 	procMulDiv           = kernel32.NewProc("MulDiv")
+	procGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
+	procGlobalFree       = kernel32.NewProc("GlobalFree")
+	procGlobalLock       = kernel32.NewProc("GlobalLock")
+	procGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
 	procCreateFontW      = gdi32.NewProc("CreateFontW")
 	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
 	procSetBkMode        = gdi32.NewProc("SetBkMode")
@@ -49,6 +58,9 @@ const (
 	wsVisible     = 0x10000000
 	wsChild       = 0x40000000
 	wsTabStop     = 0x00010000
+	wsPopup       = 0x80000000
+
+	wsExTopmost = 0x00000008
 
 	bsPushButton    = 0x00000000
 	bsDefPushButton = 0x00000001
@@ -56,6 +68,12 @@ const (
 	ssLeft          = 0x00000000
 	ssRight         = 0x00000002
 	ssEtchedHorz    = 0x00000010
+
+	ttsAlwaysTip = 0x01
+	ttsNoPrefix  = 0x02
+	ttfIdIsHwnd  = 0x0001
+	ttfSubclass  = 0x0010
+	ttmAddToolW  = 0x0400 + 50
 
 	wmDestroy        = 0x0002
 	wmCommand        = 0x0111
@@ -70,6 +88,11 @@ const (
 	bstChecked   = 0x0001
 
 	idYes = 6
+
+	cfHDrop      = 15
+	gmemMoveable = 0x0002
+	gmemZeroInit = 0x0040
+	ghnd         = gmemMoveable | gmemZeroInit
 
 	cwUseDefault     = 0x80000000
 	clearTypeQuality = 5
@@ -116,6 +139,25 @@ type initCommonControlsEx struct {
 	dwICC  uint32
 }
 
+type dropFiles struct {
+	pFiles uint32
+	pt     point
+	fNC    int32
+	fWide  int32
+}
+
+type toolInfoW struct {
+	cbSize   uint32
+	uFlags   uint32
+	hwnd     windows.HWND
+	uId      uintptr
+	rect     rect
+	hinst    windows.Handle
+	lpszText *uint16
+	lParam   uintptr
+	lpReserved unsafe.Pointer
+}
+
 var dpiScale = 1.0
 
 func px(v int32) int32 {
@@ -135,7 +177,7 @@ func initWin32() {
 
 	icc := initCommonControlsEx{
 		dwSize: uint32(unsafe.Sizeof(initCommonControlsEx{})),
-		dwICC:  0x00004000 | 0x00000008, // ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES
+		dwICC:  0x00004000 | 0x00000008 | 0x00000004, // ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_BAR_CLASSES
 	}
 	procInitCommonControlsEx.Call(uintptr(unsafe.Pointer(&icc)))
 }
@@ -181,6 +223,51 @@ func setChecked(hwnd windows.HWND, checked bool) {
 		state = uintptr(bstChecked)
 	}
 	procSendMessageW.Call(uintptr(hwnd), bmSetCheck, state, 0)
+}
+
+func copyFileToClipboard(owner windows.HWND, filePath string) error {
+	utf16Path, err := windows.UTF16FromString(filePath)
+	if err != nil {
+		return err
+	}
+	// CF_HDROP requires a double-null terminated list of UTF-16 strings
+	utf16Path = append(utf16Path, 0)
+
+	headerSize := unsafe.Sizeof(dropFiles{})
+	pathBytes := uintptr(len(utf16Path) * 2)
+	totalSize := headerSize + pathBytes
+
+	hMem, _, _ := procGlobalAlloc.Call(ghnd, totalSize)
+	if hMem == 0 {
+		return fmt.Errorf("GlobalAlloc failed")
+	}
+
+	ptr, _, _ := procGlobalLock.Call(hMem)
+	if ptr == 0 {
+		procGlobalFree.Call(hMem)
+		return fmt.Errorf("GlobalLock failed")
+	}
+
+	df := (*dropFiles)(unsafe.Pointer(ptr))
+	df.pFiles = uint32(headerSize)
+	df.fWide = 1
+
+	dst := unsafe.Slice((*uint16)(unsafe.Pointer(ptr+headerSize)), len(utf16Path))
+	copy(dst, utf16Path)
+	procGlobalUnlock.Call(hMem)
+
+	if ok, _, _ := procOpenClipboard.Call(uintptr(owner)); ok == 0 {
+		procGlobalFree.Call(hMem)
+		return fmt.Errorf("failed to open Windows clipboard")
+	}
+	defer procCloseClipboard.Call()
+
+	procEmptyClipboard.Call()
+	if res, _, _ := procSetClipboardData.Call(cfHDrop, hMem); res == 0 {
+		procGlobalFree.Call(hMem)
+		return fmt.Errorf("failed to set clipboard file data")
+	}
+	return nil
 }
 
 type uiBuilder struct {
@@ -233,4 +320,31 @@ func (b uiBuilder) checkbox(text string, id int, x, y, w, h int32, font windows.
 
 func (b uiBuilder) divider(x, y, w int32) {
 	b.control("STATIC", "", wsChild|wsVisible|ssEtchedHorz, 0, x, y, w, 2, 0)
+}
+
+func (b uiBuilder) addTooltip(target windows.HWND, text string) {
+	tipHwnd, _, _ := procCreateWindowExW.Call(
+		wsExTopmost,
+		uintptr(unsafe.Pointer(mustUTF16("tooltips_class32"))),
+		0,
+		wsPopup|ttsNoPrefix|ttsAlwaysTip,
+		cwUseDefault, cwUseDefault, cwUseDefault, cwUseDefault,
+		uintptr(b.parent),
+		0,
+		uintptr(b.hInst),
+		0,
+	)
+	if tipHwnd == 0 {
+		return
+	}
+
+	ti := toolInfoW{
+		cbSize:   uint32(unsafe.Sizeof(toolInfoW{})),
+		uFlags:   ttfIdIsHwnd | ttfSubclass,
+		hwnd:     b.parent,
+		uId:      uintptr(target),
+		hinst:    b.hInst,
+		lpszText: mustUTF16(text),
+	}
+	procSendMessageW.Call(tipHwnd, ttmAddToolW, 0, uintptr(unsafe.Pointer(&ti)))
 }

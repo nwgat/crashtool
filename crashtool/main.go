@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -15,12 +16,13 @@ import (
 
 const (
 	idBtnApply     = 101
+	idBtnApplyAll  = 105
 	idBtnDefaults  = 102
-	idBtnRefresh   = 103
 	idBtnRestart   = 104
 	idChkMemoryDmp = 107
 	idChkMinidump  = 108
 	idBtnZip       = 109
+	idBtnCopyZip   = 110
 	idChkRegBase   = 200
 )
 
@@ -29,6 +31,7 @@ type checkSyncMode int
 const (
 	checkKeep checkSyncMode = iota
 	checkAll
+	checkRegAll
 	checkDefaults
 )
 
@@ -37,10 +40,12 @@ var (
 	chkMemDmp   windows.HWND
 	chkMinidump windows.HWND
 	btnZip      windows.HWND
+	btnCopyZip  windows.HWND
 	bgBrush     windows.Handle
 
-	zipMu      sync.Mutex
-	lastZipRes zipOutcome
+	zipMu       sync.Mutex
+	lastZipRes  zipOutcome
+	lastZipPath string
 )
 
 func syncUIState(mode checkSyncMode) {
@@ -61,7 +66,7 @@ func syncUIState(mode checkSyncMode) {
 		}
 
 		switch mode {
-		case checkAll:
+		case checkAll, checkRegAll:
 			setChecked(s.CheckboxHwnd, true)
 		case checkDefaults:
 			setChecked(s.CheckboxHwnd, s.isDefaultChecked())
@@ -152,6 +157,11 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 		res := lastZipRes
 		zipMu.Unlock()
 
+		if res.success && res.zipPath != "" {
+			lastZipPath = res.zipPath
+			setControlEnabled(btnCopyZip, true)
+		}
+
 		alert(hwnd, res.title, res.message, res.flags)
 		return 0
 
@@ -170,6 +180,19 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 				)
 			}
 
+		case idBtnApplyAll:
+			if err := applyAllRegistrySettings(); err != nil {
+				alert(hwnd, "Registry Error", err.Error(), windows.MB_ICONERROR)
+			} else {
+				syncUIState(checkRegAll)
+				alert(
+					hwnd,
+					"All Settings Applied",
+					"All custom registry settings have been applied.\nRestart Windows for changes to take effect.",
+					windows.MB_ICONINFORMATION,
+				)
+			}
+
 		case idBtnDefaults:
 			if err := restoreDefaultRegistrySettings(); err != nil {
 				alert(hwnd, "Registry Error", err.Error(), windows.MB_ICONERROR)
@@ -183,9 +206,6 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 				)
 			}
 
-		case idBtnRefresh:
-			syncUIState(checkKeep)
-
 		case idBtnRestart:
 			triggerSystemRestart(hwnd)
 
@@ -196,8 +216,27 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 				alert(hwnd, "No Selection", "Please check at least one crash dump option first.", windows.MB_ICONWARNING)
 				return 0
 			}
-			if zipPath, ok := promptSaveZip(hwnd); ok {
-				startZipWorker(zipPath, incMem, incMini)
+			zipPath, err := defaultAppZipPath()
+			if err != nil {
+				alert(hwnd, "Path Error", err.Error(), windows.MB_ICONERROR)
+				return 0
+			}
+			startZipWorker(zipPath, incMem, incMini)
+
+		case idBtnCopyZip:
+			if lastZipPath == "" {
+				alert(hwnd, "No Archive", "Please create a crash dump zip archive first.", windows.MB_ICONWARNING)
+				return 0
+			}
+			if _, err := os.Stat(lastZipPath); err != nil {
+				setControlEnabled(btnCopyZip, false)
+				alert(hwnd, "File Not Found", fmt.Sprintf("The archive no longer exists at:\n%s", lastZipPath), windows.MB_ICONERROR)
+				return 0
+			}
+			if err := copyFileToClipboard(hwnd, lastZipPath); err != nil {
+				alert(hwnd, "Clipboard Error", err.Error(), windows.MB_ICONERROR)
+			} else {
+				alert(hwnd, "Copied to Clipboard", fmt.Sprintf("Copied file to clipboard:\n%s", lastZipPath), windows.MB_ICONINFORMATION)
 			}
 		}
 		return 0
@@ -285,9 +324,10 @@ func main() {
 
 	// Registry Action Bar
 	y += 14
-	ui.button("Apply", idBtnApply, 24, y, 130, 34, fontBody, true)
-	ui.button("Defaults", idBtnDefaults, 164, y, 130, 34, fontBody, false)
-	ui.button("Refresh Status", idBtnRefresh, 546, y, 130, 34, fontBody, false)
+	btnApply := ui.button("Apply", idBtnApply, 24, y, 115, 34, fontBody, true)
+	ui.addTooltip(btnApply, "Apply checked")
+	ui.button("Apply All", idBtnApplyAll, 149, y, 115, 34, fontBody, false)
+	ui.button("Defaults", idBtnDefaults, 274, y, 115, 34, fontBody, false)
 
 	// Divider
 	y += 52
@@ -299,6 +339,8 @@ func main() {
 	chkMemDmp = ui.checkbox(`Kernel Memory Dump — C:\Windows\MEMORY.DMP`, idChkMemoryDmp, 36, y+28, 640, 24, fontBody)
 	chkMinidump = ui.checkbox(`Small Memory Dump (Minidump) — C:\Windows\Minidump\`, idChkMinidump, 36, y+56, 640, 24, fontBody)
 	btnZip = ui.button("Zip Selected Dumps", idBtnZip, 24, y+92, 180, 34, fontBody, false)
+	btnCopyZip = ui.button("Copy .zip to Clipboard", idBtnCopyZip, 214, y+92, 180, 34, fontBody, false)
+	setControlEnabled(btnCopyZip, false)
 
 	syncUIState(checkAll)
 

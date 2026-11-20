@@ -183,6 +183,15 @@ func applyCheckedRegistrySettings() error {
 	return nil
 }
 
+func applyAllRegistrySettings() error {
+	for _, s := range regSettings {
+		if err := s.applyCustom(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func restoreDefaultRegistrySettings() error {
 	for _, s := range regSettings {
 		if err := s.applyDefault(); err != nil {
@@ -193,7 +202,7 @@ func restoreDefaultRegistrySettings() error {
 }
 EOF
 
-# 2. Crash dump discovery, Save As dialog, and ZIP creation
+# 2. Crash dump discovery and ZIP creation
 cat << 'EOF' > dumps.go
 //go:build windows
 
@@ -207,7 +216,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -215,47 +223,14 @@ import (
 const (
 	memoryDmpPath = `C:\Windows\MEMORY.DMP`
 	minidumpDir   = `C:\Windows\Minidump`
-
-	ofnOverwritePrompt = 0x00000002
-	ofnNoChangeDir     = 0x00000008
-	ofnPathMustExist   = 0x00000800
 )
-
-var (
-	comdlg32             = windows.NewLazySystemDLL("comdlg32.dll")
-	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
-)
-
-type openFileNameW struct {
-	lStructSize       uint32
-	hwndOwner         windows.HWND
-	hInstance         windows.Handle
-	lpstrFilter       *uint16
-	lpstrCustomFilter *uint16
-	nMaxCustFilter    uint32
-	nFilterIndex      uint32
-	lpstrFile         *uint16
-	nMaxFile          uint32
-	lpstrFileTitle    *uint16
-	nMaxFileTitle     uint32
-	lpstrInitialDir   *uint16
-	lpstrTitle        *uint16
-	flags             uint32
-	nFileOffset       uint16
-	nFileExtension    uint16
-	lpstrDefExt       *uint16
-	lCustData         uintptr
-	lpfnHook          uintptr
-	lpTemplateName    *uint16
-	pvReserved        unsafe.Pointer
-	dwReserved        uint32
-	flagsEx           uint32
-}
 
 type zipOutcome struct {
 	title   string
 	message string
 	flags   uint32
+	zipPath string
+	success bool
 }
 
 func humanBytes(b int64) string {
@@ -313,59 +288,14 @@ func checkMinidumps() (label string, available bool) {
 	), true
 }
 
-func promptSaveZip(owner windows.HWND) (string, bool) {
-	initialDir, err := os.UserHomeDir()
+func defaultAppZipPath() (string, error) {
+	exePath, err := os.Executable()
 	if err != nil {
-		initialDir = `C:\`
+		return "", fmt.Errorf("failed to resolve application directory: %w", err)
 	}
-	if desktop := filepath.Join(initialDir, "Desktop"); dirExists(desktop) {
-		initialDir = desktop
-	}
-
-	defaultName := fmt.Sprintf("CrashDumps_%s.zip", time.Now().Format("20060102_150405"))
-	buf := make([]uint16, 32768)
-	if u, err := windows.UTF16FromString(defaultName); err == nil {
-		copy(buf, u)
-	}
-
-	filter := encodeFileFilter("ZIP Archives (*.zip)", "*.zip", "All Files (*.*)", "*.*")
-	dirPtr, _ := windows.UTF16PtrFromString(initialDir)
-	titlePtr, _ := windows.UTF16PtrFromString("Save Crash Dumps Archive")
-	extPtr, _ := windows.UTF16PtrFromString("zip")
-
-	ofn := openFileNameW{
-		lStructSize:     uint32(unsafe.Sizeof(openFileNameW{})),
-		hwndOwner:       owner,
-		lpstrFilter:     &filter[0],
-		nFilterIndex:    1,
-		lpstrFile:       &buf[0],
-		nMaxFile:        uint32(len(buf)),
-		lpstrInitialDir: dirPtr,
-		lpstrTitle:      titlePtr,
-		flags:           ofnOverwritePrompt | ofnPathMustExist | ofnNoChangeDir,
-		lpstrDefExt:     extPtr,
-	}
-
-	ret, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
-	if ret == 0 {
-		return "", false
-	}
-	return windows.UTF16ToString(buf), true
-}
-
-func dirExists(path string) bool {
-	fi, err := os.Stat(path)
-	return err == nil && fi.IsDir()
-}
-
-func encodeFileFilter(pairs ...string) []uint16 {
-	var out []uint16
-	for _, s := range pairs {
-		if u, err := windows.UTF16FromString(s); err == nil {
-			out = append(out, u...)
-		}
-	}
-	return append(out, 0)
+	appDir := filepath.Dir(exePath)
+	fileName := fmt.Sprintf("CrashDumps_%s.zip", time.Now().Format("20060102_150405"))
+	return filepath.Join(appDir, fileName), nil
 }
 
 func writeZipEntry(zw *zip.Writer, srcPath, entryName string) error {
@@ -464,17 +394,20 @@ func createCrashDumpArchive(zipPath string, includeMemDmp, includeMinidump bool)
 		title:   "Compression Complete",
 		message: fmt.Sprintf("Successfully compressed %d file(s) (%s).\n\nSaved to:\n%s", added, sizeText, zipPath),
 		flags:   windows.MB_ICONINFORMATION,
+		zipPath: zipPath,
+		success: true,
 	}
 }
 EOF
 
-# 3. Win32 API bindings, DPI scaling, and control builders
+# 3. Win32 API bindings, DPI scaling, tooltips, clipboard file copy, and control builders
 cat << 'EOF' > win32.go
 //go:build windows
 
 package main
 
 import (
+	"fmt"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -502,8 +435,16 @@ var (
 	procGetDpiForSystem           = user32.NewProc("GetDpiForSystem")
 	procAdjustWindowRectEx        = user32.NewProc("AdjustWindowRectEx")
 	procSetProcessDpiAwarenessCtx = user32.NewProc("SetProcessDpiAwarenessContext")
+	procOpenClipboard             = user32.NewProc("OpenClipboard")
+	procCloseClipboard            = user32.NewProc("CloseClipboard")
+	procEmptyClipboard            = user32.NewProc("EmptyClipboard")
+	procSetClipboardData          = user32.NewProc("SetClipboardData")
 
 	procMulDiv           = kernel32.NewProc("MulDiv")
+	procGlobalAlloc      = kernel32.NewProc("GlobalAlloc")
+	procGlobalFree       = kernel32.NewProc("GlobalFree")
+	procGlobalLock       = kernel32.NewProc("GlobalLock")
+	procGlobalUnlock     = kernel32.NewProc("GlobalUnlock")
 	procCreateFontW      = gdi32.NewProc("CreateFontW")
 	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
 	procSetBkMode        = gdi32.NewProc("SetBkMode")
@@ -521,6 +462,9 @@ const (
 	wsVisible     = 0x10000000
 	wsChild       = 0x40000000
 	wsTabStop     = 0x00010000
+	wsPopup       = 0x80000000
+
+	wsExTopmost = 0x00000008
 
 	bsPushButton    = 0x00000000
 	bsDefPushButton = 0x00000001
@@ -528,6 +472,12 @@ const (
 	ssLeft          = 0x00000000
 	ssRight         = 0x00000002
 	ssEtchedHorz    = 0x00000010
+
+	ttsAlwaysTip = 0x01
+	ttsNoPrefix  = 0x02
+	ttfIdIsHwnd  = 0x0001
+	ttfSubclass  = 0x0010
+	ttmAddToolW  = 0x0400 + 50
 
 	wmDestroy        = 0x0002
 	wmCommand        = 0x0111
@@ -542,6 +492,11 @@ const (
 	bstChecked   = 0x0001
 
 	idYes = 6
+
+	cfHDrop      = 15
+	gmemMoveable = 0x0002
+	gmemZeroInit = 0x0040
+	ghnd         = gmemMoveable | gmemZeroInit
 
 	cwUseDefault     = 0x80000000
 	clearTypeQuality = 5
@@ -588,6 +543,25 @@ type initCommonControlsEx struct {
 	dwICC  uint32
 }
 
+type dropFiles struct {
+	pFiles uint32
+	pt     point
+	fNC    int32
+	fWide  int32
+}
+
+type toolInfoW struct {
+	cbSize   uint32
+	uFlags   uint32
+	hwnd     windows.HWND
+	uId      uintptr
+	rect     rect
+	hinst    windows.Handle
+	lpszText *uint16
+	lParam   uintptr
+	lpReserved unsafe.Pointer
+}
+
 var dpiScale = 1.0
 
 func px(v int32) int32 {
@@ -607,7 +581,7 @@ func initWin32() {
 
 	icc := initCommonControlsEx{
 		dwSize: uint32(unsafe.Sizeof(initCommonControlsEx{})),
-		dwICC:  0x00004000 | 0x00000008, // ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES
+		dwICC:  0x00004000 | 0x00000008 | 0x00000004, // ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_BAR_CLASSES
 	}
 	procInitCommonControlsEx.Call(uintptr(unsafe.Pointer(&icc)))
 }
@@ -653,6 +627,51 @@ func setChecked(hwnd windows.HWND, checked bool) {
 		state = uintptr(bstChecked)
 	}
 	procSendMessageW.Call(uintptr(hwnd), bmSetCheck, state, 0)
+}
+
+func copyFileToClipboard(owner windows.HWND, filePath string) error {
+	utf16Path, err := windows.UTF16FromString(filePath)
+	if err != nil {
+		return err
+	}
+	// CF_HDROP requires a double-null terminated list of UTF-16 strings
+	utf16Path = append(utf16Path, 0)
+
+	headerSize := unsafe.Sizeof(dropFiles{})
+	pathBytes := uintptr(len(utf16Path) * 2)
+	totalSize := headerSize + pathBytes
+
+	hMem, _, _ := procGlobalAlloc.Call(ghnd, totalSize)
+	if hMem == 0 {
+		return fmt.Errorf("GlobalAlloc failed")
+	}
+
+	ptr, _, _ := procGlobalLock.Call(hMem)
+	if ptr == 0 {
+		procGlobalFree.Call(hMem)
+		return fmt.Errorf("GlobalLock failed")
+	}
+
+	df := (*dropFiles)(unsafe.Pointer(ptr))
+	df.pFiles = uint32(headerSize)
+	df.fWide = 1
+
+	dst := unsafe.Slice((*uint16)(unsafe.Pointer(ptr+headerSize)), len(utf16Path))
+	copy(dst, utf16Path)
+	procGlobalUnlock.Call(hMem)
+
+	if ok, _, _ := procOpenClipboard.Call(uintptr(owner)); ok == 0 {
+		procGlobalFree.Call(hMem)
+		return fmt.Errorf("failed to open Windows clipboard")
+	}
+	defer procCloseClipboard.Call()
+
+	procEmptyClipboard.Call()
+	if res, _, _ := procSetClipboardData.Call(cfHDrop, hMem); res == 0 {
+		procGlobalFree.Call(hMem)
+		return fmt.Errorf("failed to set clipboard file data")
+	}
+	return nil
 }
 
 type uiBuilder struct {
@@ -706,6 +725,33 @@ func (b uiBuilder) checkbox(text string, id int, x, y, w, h int32, font windows.
 func (b uiBuilder) divider(x, y, w int32) {
 	b.control("STATIC", "", wsChild|wsVisible|ssEtchedHorz, 0, x, y, w, 2, 0)
 }
+
+func (b uiBuilder) addTooltip(target windows.HWND, text string) {
+	tipHwnd, _, _ := procCreateWindowExW.Call(
+		wsExTopmost,
+		uintptr(unsafe.Pointer(mustUTF16("tooltips_class32"))),
+		0,
+		wsPopup|ttsNoPrefix|ttsAlwaysTip,
+		cwUseDefault, cwUseDefault, cwUseDefault, cwUseDefault,
+		uintptr(b.parent),
+		0,
+		uintptr(b.hInst),
+		0,
+	)
+	if tipHwnd == 0 {
+		return
+	}
+
+	ti := toolInfoW{
+		cbSize:   uint32(unsafe.Sizeof(toolInfoW{})),
+		uFlags:   ttfIdIsHwnd | ttfSubclass,
+		hwnd:     b.parent,
+		uId:      uintptr(target),
+		hinst:    b.hInst,
+		lpszText: mustUTF16(text),
+	}
+	procSendMessageW.Call(tipHwnd, ttmAddToolW, 0, uintptr(unsafe.Pointer(&ti)))
+}
 EOF
 
 # 4. Main window, state synchronization, and event loop
@@ -716,6 +762,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -727,12 +774,13 @@ import (
 
 const (
 	idBtnApply     = 101
+	idBtnApplyAll  = 105
 	idBtnDefaults  = 102
-	idBtnRefresh   = 103
 	idBtnRestart   = 104
 	idChkMemoryDmp = 107
 	idChkMinidump  = 108
 	idBtnZip       = 109
+	idBtnCopyZip   = 110
 	idChkRegBase   = 200
 )
 
@@ -741,6 +789,7 @@ type checkSyncMode int
 const (
 	checkKeep checkSyncMode = iota
 	checkAll
+	checkRegAll
 	checkDefaults
 )
 
@@ -749,10 +798,12 @@ var (
 	chkMemDmp   windows.HWND
 	chkMinidump windows.HWND
 	btnZip      windows.HWND
+	btnCopyZip  windows.HWND
 	bgBrush     windows.Handle
 
-	zipMu      sync.Mutex
-	lastZipRes zipOutcome
+	zipMu       sync.Mutex
+	lastZipRes  zipOutcome
+	lastZipPath string
 )
 
 func syncUIState(mode checkSyncMode) {
@@ -773,7 +824,7 @@ func syncUIState(mode checkSyncMode) {
 		}
 
 		switch mode {
-		case checkAll:
+		case checkAll, checkRegAll:
 			setChecked(s.CheckboxHwnd, true)
 		case checkDefaults:
 			setChecked(s.CheckboxHwnd, s.isDefaultChecked())
@@ -864,6 +915,11 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 		res := lastZipRes
 		zipMu.Unlock()
 
+		if res.success && res.zipPath != "" {
+			lastZipPath = res.zipPath
+			setControlEnabled(btnCopyZip, true)
+		}
+
 		alert(hwnd, res.title, res.message, res.flags)
 		return 0
 
@@ -882,6 +938,19 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 				)
 			}
 
+		case idBtnApplyAll:
+			if err := applyAllRegistrySettings(); err != nil {
+				alert(hwnd, "Registry Error", err.Error(), windows.MB_ICONERROR)
+			} else {
+				syncUIState(checkRegAll)
+				alert(
+					hwnd,
+					"All Settings Applied",
+					"All custom registry settings have been applied.\nRestart Windows for changes to take effect.",
+					windows.MB_ICONINFORMATION,
+				)
+			}
+
 		case idBtnDefaults:
 			if err := restoreDefaultRegistrySettings(); err != nil {
 				alert(hwnd, "Registry Error", err.Error(), windows.MB_ICONERROR)
@@ -895,9 +964,6 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 				)
 			}
 
-		case idBtnRefresh:
-			syncUIState(checkKeep)
-
 		case idBtnRestart:
 			triggerSystemRestart(hwnd)
 
@@ -908,8 +974,27 @@ func wndProc(hwnd windows.HWND, uMsg uint32, wParam, lParam uintptr) uintptr {
 				alert(hwnd, "No Selection", "Please check at least one crash dump option first.", windows.MB_ICONWARNING)
 				return 0
 			}
-			if zipPath, ok := promptSaveZip(hwnd); ok {
-				startZipWorker(zipPath, incMem, incMini)
+			zipPath, err := defaultAppZipPath()
+			if err != nil {
+				alert(hwnd, "Path Error", err.Error(), windows.MB_ICONERROR)
+				return 0
+			}
+			startZipWorker(zipPath, incMem, incMini)
+
+		case idBtnCopyZip:
+			if lastZipPath == "" {
+				alert(hwnd, "No Archive", "Please create a crash dump zip archive first.", windows.MB_ICONWARNING)
+				return 0
+			}
+			if _, err := os.Stat(lastZipPath); err != nil {
+				setControlEnabled(btnCopyZip, false)
+				alert(hwnd, "File Not Found", fmt.Sprintf("The archive no longer exists at:\n%s", lastZipPath), windows.MB_ICONERROR)
+				return 0
+			}
+			if err := copyFileToClipboard(hwnd, lastZipPath); err != nil {
+				alert(hwnd, "Clipboard Error", err.Error(), windows.MB_ICONERROR)
+			} else {
+				alert(hwnd, "Copied to Clipboard", fmt.Sprintf("Copied file to clipboard:\n%s", lastZipPath), windows.MB_ICONINFORMATION)
 			}
 		}
 		return 0
@@ -997,9 +1082,10 @@ func main() {
 
 	// Registry Action Bar
 	y += 14
-	ui.button("Apply", idBtnApply, 24, y, 130, 34, fontBody, true)
-	ui.button("Defaults", idBtnDefaults, 164, y, 130, 34, fontBody, false)
-	ui.button("Refresh Status", idBtnRefresh, 546, y, 130, 34, fontBody, false)
+	btnApply := ui.button("Apply", idBtnApply, 24, y, 115, 34, fontBody, true)
+	ui.addTooltip(btnApply, "Apply checked")
+	ui.button("Apply All", idBtnApplyAll, 149, y, 115, 34, fontBody, false)
+	ui.button("Defaults", idBtnDefaults, 274, y, 115, 34, fontBody, false)
 
 	// Divider
 	y += 52
@@ -1011,6 +1097,8 @@ func main() {
 	chkMemDmp = ui.checkbox(`Kernel Memory Dump — C:\Windows\MEMORY.DMP`, idChkMemoryDmp, 36, y+28, 640, 24, fontBody)
 	chkMinidump = ui.checkbox(`Small Memory Dump (Minidump) — C:\Windows\Minidump\`, idChkMinidump, 36, y+56, 640, 24, fontBody)
 	btnZip = ui.button("Zip Selected Dumps", idBtnZip, 24, y+92, 180, 34, fontBody, false)
+	btnCopyZip = ui.button("Copy .zip to Clipboard", idBtnCopyZip, 214, y+92, 180, 34, fontBody, false)
+	setControlEnabled(btnCopyZip, false)
 
 	syncUIState(checkAll)
 

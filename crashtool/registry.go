@@ -119,6 +119,15 @@ func applyCheckedRegistrySettings() error {
 	return nil
 }
 
+func applyAllRegistrySettings() error {
+	for _, s := range regSettings {
+		if err := s.applyCustom(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func restoreDefaultRegistrySettings() error {
 	for _, s := range regSettings {
 		if err := s.applyDefault(); err != nil {
