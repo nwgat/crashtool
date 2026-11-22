@@ -1,0 +1,55 @@
+name: Build CrashTool
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write # Needed to attach CrashTool.exe to GitHub Releases on version tags
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: 0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Generate Windows resource (.syso)
+        run: go run github.com/tc-hib/go-winres@latest make --in winres.json --arch amd64
+
+      - name: Vet Windows code
+        run: go vet ./...
+
+      - name: Build CrashTool.exe
+        run: go build -trimpath -ldflags="-s -w -H windowsgui" -o CrashTool.exe .
+
+      - name: Upload CrashTool.exe build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrashTool-windows-amd64
+          path: CrashTool.exe
+          if-no-files-found: error
+
+      - name: Create GitHub Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CrashTool.exe
+          generate_release_notes: true
