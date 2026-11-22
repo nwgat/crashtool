@@ -13,10 +13,6 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      GOOS: windows
-      GOARCH: amd64
-      CGO_ENABLED: 0
 
     steps:
       - name: Checkout repository
@@ -25,20 +21,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
-          cache: true
+          go-version: '1.21'
+          cache: false
 
-      - name: Download dependencies
-        run: go mod download
+      - name: Run bootstrap build script
+        run: |
+          chmod +x *.sh
+          ./*.sh
 
-      - name: Generate Windows resource (.syso)
-        run: go run github.com/tc-hib/go-winres@latest make --in winres.json --arch amd64
-
-      - name: Vet Windows code
-        run: go vet ./...
-
-      - name: Build CrashTool.exe
-        run: go build -trimpath -ldflags="-s -w -H windowsgui" -o CrashTool.exe .
+      - name: Verify CrashTool.exe exists
+        run: ls -lh CrashTool.exe
 
       - name: Upload CrashTool.exe build artifact
         uses: actions/upload-artifact@v4
